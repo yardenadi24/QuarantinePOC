@@ -8,11 +8,12 @@
 
 #define DRIVER_TAG 'tnrQ'
 #define DRIVER_PREFIX "QuarantineDrv: "
+#define PORT_NAME L"\\QuarantineDrv"
 
 #define LOG(s, ...) DbgPrint(DRIVER_PREFIX "%s::" s "\n",__FUNCTION__,__VA_ARGS__)
 
-#define MAX_PATH 256
 #define QuarantineDirPath L"C:\\EdrPOC\\Quarantine"
+#define MAX_PATH 256
 
 // Declarations
 
@@ -91,4 +92,28 @@ FLT_PREOP_CALLBACK_STATUS OnPreCreateFile(
 	PFLT_CALLBACK_DATA Data,
 	PCFLT_RELATED_OBJECTS FltObjects,
 	PVOID*
+);
+
+VOID
+DisconnectNotifyCallback(
+	PVOID ConnectionCookie
+);
+
+NTSTATUS
+ConnectNotifyCallback(
+	PFLT_PORT ClientPort,
+	PVOID ServerPortCookie,
+	PVOID ConnectionContext,
+	ULONG SizeOfContext,
+	PVOID* ConnectionPortCookie
+);
+
+NTSTATUS
+MessageNotifyCallback(
+	PVOID PortCookie,
+	PVOID InputBuffer,
+	ULONG InputBufferSize,
+	PVOID OutputBuffer,
+	ULONG OutputBufferSize,
+	PULONG ReturnOutputLength
 );

@@ -1,8 +1,12 @@
 #include "drv.h"
 
 PFLT_FILTER g_pFilter;
+PFLT_PORT g_pServerPort;
+PFLT_PORT g_pClientPort;
 PDRIVER_OBJECT g_pDriverObject;
 PUNICODE_STRING g_pQuarantineDirPath;
+
+
 
 NTSTATUS
 CompleteRequest(
@@ -20,7 +24,9 @@ CompleteRequest(
 
 extern "C"
 NTSTATUS
-DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
+DriverEntry(
+	PDRIVER_OBJECT DriverObject,
+	PUNICODE_STRING RegistryPath)
 {
 	UNREFERENCED_PARAMETER(DriverObject);
 	UNREFERENCED_PARAMETER(RegistryPath);
@@ -41,7 +47,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 		Status = InitMiniFilter(DriverObject, RegistryPath);
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("Failed to init minifilter (0x%u)", Status);
+			LOG("Failed to init minifilter (0x%X)", Status);
 			break;
 		}
 		
@@ -57,7 +63,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 			&DeviceObj);
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("Failed to create device (0x%u)", Status);
+			LOG("Failed to create device (0x%X)", Status);
 			break;
 		}
 
@@ -65,7 +71,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 		Status = IoCreateSymbolicLink(&Symlink, &DeviceName);
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("Failed to symboliclink (0x%u)", Status);
+			LOG("Failed to symboliclink (0x%X)", Status);
 			break;
 		}
 		else {
@@ -81,6 +87,33 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 		}
 
 		RtlInitUnicodeString(g_pQuarantineDirPath, QuarantineDirPath);
+		
+		UNICODE_STRING PortName = RTL_CONSTANT_STRING(L"\\BackupPort");
+		OBJECT_ATTRIBUTES PortNameObjectAttr;
+		PSECURITY_DESCRIPTOR Sd;
+		Status = FltBuildDefaultSecurityDescriptor(&Sd, FLT_PORT_ALL_ACCESS);
+		if (!NT_SUCCESS(Status)) {
+			LOG("Fail creating SD for port");
+			break;
+		}
+
+		InitializeObjectAttributes(&PortNameObjectAttr, &PortName, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, Sd);
+		// Create the communication port
+		Status = FltCreateCommunicationPort(
+			g_pFilter,
+			&g_pServerPort,
+			&PortNameObjectAttr,
+			NULL,
+			ConnectNotifyCallback,
+			DisconnectNotifyCallback,
+			MessageNotifyCallback,
+			1 // Max connections
+		);
+
+		if (!NT_SUCCESS(Status)) {
+			LOG("Fail creating minifilter port");
+			break;
+		}
 
 		// Start filtering
 		Status = FltStartFiltering(g_pFilter);
@@ -91,14 +124,14 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 		}
 
 
-
-
 	} while (false);
 
 	if (!NT_SUCCESS(Status))
 	{
-		LOG("Error in DriverEntry: 0x%u", Status);
+		LOG("Error in DriverEntry: 0x%X", Status);
 
+		if (g_pServerPort)
+			FltCloseCommunicationPort(g_pServerPort);
 		if (g_pFilter)
 			FltUnregisterFilter(g_pFilter);
 		if (SymlinkCreated)
@@ -119,6 +152,57 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 	LOG("DriverEntry success");
 
 	return Status;
+}
+
+VOID
+DisconnectNotifyCallback(
+	PVOID ConnectionCookie
+)
+{
+	UNREFERENCED_PARAMETER(ConnectionCookie);
+	LOG("Enter");
+
+	FltCloseClientPort(g_pFilter, &g_pClientPort);
+	g_pClientPort = NULL;
+}
+
+NTSTATUS
+ConnectNotifyCallback(
+	PFLT_PORT ClientPort,
+	PVOID ServerPortCookie,
+	PVOID ConnectionContext,
+	ULONG SizeOfContext,
+	PVOID* ConnectionPortCookie
+)
+{
+	UNREFERENCED_PARAMETER(ClientPort);
+	UNREFERENCED_PARAMETER(ServerPortCookie);
+	UNREFERENCED_PARAMETER(ConnectionContext);
+	UNREFERENCED_PARAMETER(SizeOfContext);
+	UNREFERENCED_PARAMETER(ConnectionPortCookie);
+	g_pClientPort = ClientPort;
+	LOG("Enter");
+	return NTSTATUS();
+}
+
+NTSTATUS
+MessageNotifyCallback(
+	PVOID PortCookie,
+	PVOID InputBuffer,
+	ULONG InputBufferSize,
+	PVOID OutputBuffer,
+	ULONG OutputBufferSize,
+	PULONG ReturnOutputLength
+)
+{
+	UNREFERENCED_PARAMETER(PortCookie);
+	UNREFERENCED_PARAMETER(InputBuffer);
+	UNREFERENCED_PARAMETER(InputBufferSize);
+	UNREFERENCED_PARAMETER(OutputBuffer);
+	UNREFERENCED_PARAMETER(OutputBufferSize);
+	UNREFERENCED_PARAMETER(ReturnOutputLength);
+	LOG("Enter");
+	return NTSTATUS();
 }
 
 NTSTATUS
@@ -166,7 +250,7 @@ InitMiniFilter(
 			&KeyAttr);
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("ZwOpenKey::Failed open key (0x%u)", Status);
+			LOG("ZwOpenKey::Failed open key (0x%X)", Status);
 			break;
 		}
 
@@ -189,7 +273,7 @@ InitMiniFilter(
 			NULL);
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("ZwCreateKey::Failed open subkey (0x%u)", Status);
+			LOG("ZwCreateKey::Failed open subkey (0x%X)", Status);
 			break;
 		}
 
@@ -205,7 +289,7 @@ InitMiniFilter(
 			sizeof(Name));
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("ZwSetValueKey::Failed setting default instance name (0x%u)", Status);
+			LOG("ZwSetValueKey::Failed setting default instance name (0x%X)", Status);
 			break;
 		}
 
@@ -230,7 +314,7 @@ InitMiniFilter(
 		);
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("ZwCreateKey::Failed creating instance key (0x%u)", Status);
+			LOG("ZwCreateKey::Failed creating instance key (0x%X)", Status);
 			break;
 		}
 
@@ -246,7 +330,7 @@ InitMiniFilter(
 			sizeof(Altitude));
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("ZwSetValueKey::Failed writing altitude (0x%u)", Status);
+			LOG("ZwSetValueKey::Failed writing altitude (0x%X)", Status);
 			break;
 		}
 
@@ -262,7 +346,7 @@ InitMiniFilter(
 			sizeof(Flags));
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("ZwSetValueKey::Failed writing flags (0x%u)", Status);
+			LOG("ZwSetValueKey::Failed writing flags (0x%X)", Status);
 			break;
 		}
 
@@ -294,7 +378,7 @@ InitMiniFilter(
 		Status = FltRegisterFilter(pDriverObject, &Reg, &g_pFilter);
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("FltRegisterFilter::Failed FltRegisterFilter (0x%u)", Status);
+			LOG("FltRegisterFilter::Failed FltRegisterFilter (0x%X)", Status);
 			break;
 		}
 
@@ -326,6 +410,8 @@ QuarantineUnload(
 {
 	UNREFERENCED_PARAMETER(Flags);
 	LOG("Unloading quarantine filter");
+	if (g_pServerPort)
+		FltCloseCommunicationPort(g_pServerPort);
 	FltUnregisterFilter(g_pFilter);
 	UNICODE_STRING Symlink = RTL_CONSTANT_STRING(L"\\??\\Quarantine");
 	IoDeleteSymbolicLink(&Symlink);
