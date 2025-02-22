@@ -1,6 +1,5 @@
 #include "drv.h"
 
-EXECUTIVE_RESOURCE g_Lock;
 PFLT_FILTER g_pFilter;
 PDRIVER_OBJECT g_pDriverObject;
 PUNICODE_STRING g_pQuarantineDirPath;
@@ -273,6 +272,7 @@ InitMiniFilter(
 		FLT_OPERATION_REGISTRATION CONST Callbacks[] =
 		{
 			{IRP_MJ_DIRECTORY_CONTROL, 0, OnPreDirectoryControl, OnPostDirectoryControl},
+			{ IRP_MJ_CREATE, 0, OnPreCreateFile, NULL },
 			{IRP_MJ_OPERATION_END}
 		};
 
@@ -394,6 +394,83 @@ QuarantineInstanceTeardownComplete(
 	LOG("Enter");
 }
 
+// intercept IO request to directly open the directory
+FLT_PREOP_CALLBACK_STATUS OnPreCreateFile(
+	PFLT_CALLBACK_DATA Data,
+	PCFLT_RELATED_OBJECTS FltObjects,
+	PVOID*
+)
+{
+	UNREFERENCED_PARAMETER(FltObjects);
+
+	FLT_PREOP_CALLBACK_STATUS Status = FLT_PREOP_SUCCESS_NO_CALLBACK;
+	if (Data->RequestorMode == KernelMode)
+		return Status;
+
+	auto const& Params = Data->Iopb->Parameters.Create;
+
+	if (!(Params.Options & FILE_DIRECTORY_FILE || Params.Options & FILE_DELETE_ON_CLOSE))
+		return Status;
+
+	// Its an attempt to interact with a file we should
+	// check if its our directory
+	// We want to receive the DOS path of the directory
+	// to compare with the parent directory of our quarantine dir
+	PFLT_FILE_NAME_INFORMATION FileNameInfo;
+	POBJECT_NAME_INFORMATION ObjectNameInformation;
+
+	// Get the device in DOS format
+	IoQueryFileDosDeviceName(FltObjects->FileObject, &ObjectNameInformation);
+	// Get the full file name out of the IO data (without the device name)
+	NTSTATUS NtStatus = FltGetFileNameInformation(Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &FileNameInfo);
+
+	// If success we can combine the names and compare with our directory
+	if (NT_SUCCESS(NtStatus) && ObjectNameInformation)
+	{
+		UNICODE_STRING DeviceLessPath = FltObjects->FileObject->FileName;
+		UNICODE_STRING DeviceDOS = ObjectNameInformation->Name;
+
+		USHORT Length = DeviceLessPath.Length + DeviceDOS.Length;
+		PWCHAR Buffer = NULL;
+
+		Buffer = (PWCHAR)ExAllocatePool(NonPagedPool, Length);
+		if (Buffer == NULL)
+		{
+			LOG("Failed to allocate memory for the path buffer");
+			goto exit;
+		}
+
+		UNICODE_STRING FullDOSFilename;
+		
+		// Copy full dos path
+		FullDOSFilename.Length = Length;
+		FullDOSFilename.Buffer = Buffer;
+		RtlCopyMemory(FullDOSFilename.Buffer, DeviceDOS.Buffer, DeviceDOS.Length);
+		RtlCopyMemory(FullDOSFilename.Buffer + (DeviceDOS.Length / sizeof(WCHAR)), DeviceLessPath.Buffer, DeviceLessPath.Length);
+
+		if (RtlEqualUnicodeString(&FullDOSFilename, g_pQuarantineDirPath, TRUE))
+		{
+			// There is a match, we should intercept this operation
+			// Any one should think this directory dose not exists
+			LOG("Prevented interaction with %wZ", FullDOSFilename);
+			Data->IoStatus.Status = STATUS_NO_SUCH_FILE;
+			Status = FLT_PREOP_COMPLETE;
+		}
+		
+		ExFreePool(Buffer);
+	}
+
+	
+exit:
+	if(NT_SUCCESS(NtStatus))
+		FltReleaseFileNameInformation(FileNameInfo);
+	if(ObjectNameInformation)
+		ExFreePool(ObjectNameInformation);
+
+
+	return Status;
+}
+
 
 // On the PostDirectoryControl we can catch
 // i/o requests to see the content of the **folder that contains**
@@ -408,7 +485,7 @@ OnPostDirectoryControl(
 )
 {
 	UNREFERENCED_PARAMETER(FltObjects);
-	LOG("Enter");
+
 	if (Data->RequestorMode == KernelMode ||
 		Data->Iopb->MinorFunction != IRP_MN_QUERY_DIRECTORY ||
 		(Flags & FLTFL_POST_OPERATION_DRAINING) //this post-operation
@@ -422,7 +499,7 @@ OnPostDirectoryControl(
 
 	if (FltObjects->FileObject->FileName.Length <= 0)
 	{
-		LOG("The file name length is >=0  so its possiable a TAB complition");
+		LOG("The file name length is >=0  so its possible a TAB completion");
 		return FLT_POSTOP_FINISHED_PROCESSING;
 	}
 
@@ -461,8 +538,6 @@ OnPostDirectoryControl(
 	IoQueryFileDosDeviceName(FltObjects->FileObject, &pDosPath);
 	if (pDosPath)
 	{
-
-		LOG("Post Querying: '%wZ',  Our quarantine dir: '%wZ'", pDosPath->Name, *g_pQuarantineDirPath);		
 		PUCHAR Base = NULL;
 		
 		// If MDL is available we should use it to retrieve the path
@@ -482,25 +557,12 @@ OnPostDirectoryControl(
 		
 		UNICODE_STRING ParentDir;
 		ParentDir.Buffer = g_pQuarantineDirPath->Buffer;
-		// Calculate the length of the full parent directory path
-		// C:\x\y\z\QuarantineDir
-	    // ^       ^
-		//Start    LastBackslash
-		// 0x3     0xB
-		// 0xB - 0x3 = 0x8 (11 - 3 = 8) 
-		// We need to add 1 to include the last backslash too
-		// Then we get the length of: 'C:\x\y\z\' Which is the parent directory
-		// of the QuarantineDir
-		// This way 'ParentDir' is basically the path of the parent directory of 
-		// The quarantine dir
-		ParentDir.Length = USHORT(LastBackSlash - g_pQuarantineDirPath->Buffer) * sizeof(WCHAR);
 
-		LOG("Parent dir of our quarantine dir: %wZ, The current dir: %wZ", ParentDir, pDosPath->Name);
+		// Calculate the length of the full parent directory path
+		ParentDir.Length = USHORT(LastBackSlash - g_pQuarantineDirPath->Buffer) * sizeof(WCHAR);
 
 		if (RtlEqualUnicodeString(&ParentDir, &pDosPath->Name, TRUE))
 		{
-			LOG("There is a match IO request for our parent dir");
-
 			// We got an IO request that will reveal our hidden quarantine directory
 			// We should hide it
 			ULONG NextOffset = 0;
@@ -529,67 +591,30 @@ OnPostDirectoryControl(
 
 				UNICODE_STRING FileNameDebug;
 				RtlInitUnicodeString(&FileNameDebug, FileName);
-				LOG("Current entry: %wZ", FileNameDebug);
 
 				// If the current entry is our directory we want to hide it form the list
 				if (FileNameLength && _wcsnicmp(QuarantineDirName, FileName, FileNameLength / sizeof(WCHAR)) == 0)
 				{
-					LOG("We found our entry");
+					LOG("Found our directory, hiding it");
 					//First entry, just move the buffer pointer to the next entry
 					if (Prev == NULL)
 					{
-						LOG("Prev is NULL");
 						Params.DirectoryBuffer = Base + NextOffset;
 						FltSetCallbackDataDirty(Data);
 					}
 					else {
-						LOG("Update prev to point to the next offset");
 						// Not the first entry, we should just update the prev entry to point
 						// to the current next entry
-						//PUCHAR TheNextPrevBefore = Prev + *(PULONG)(Prev + pFID->NextEntryOffset);
 						if (NextOffset == 0)
 						{
 							// The entry is the last one we should SET the prev nextEntry to 0
-							LOG("Our directory is the last one");
 							*(PULONG)(Prev + pFID->NextEntryOffset) = 0;
 						}
 						else {
-							// nextEntry none zero we should ADD the current nextOffset
-							LOG("Setting the prev nextOffset");
 							*(PULONG)(Prev + pFID->NextEntryOffset) += NextOffset;
-							//}
-							//PUCHAR TheNextPrevAfter = Prev + *(PULONG)(Prev + pFID->NextEntryOffset);
 
-
-							//// Test it works 
-
-							//PCWSTR FileNameBefore = (PCWSTR)(TheNextPrevBefore + pFID->FileNameOffset);
-							//ULONG FileNameLengthBefore = *(PULONG)(TheNextPrevBefore + pFID->FileNameLengthOffset);
-							//if (FileNameLengthBefore)
-							//{
-							//	UNICODE_STRING FileNameBeforeDebug;
-							//	RtlInitUnicodeString(&FileNameBeforeDebug, FileNameBefore);
-							//	LOG("----The name of prev->next before change: %wZ", FileNameBeforeDebug);
-							//}
-							//else {
-							//	LOG("----The name of prev->next before change: is not existing");
-							//}
-
-							//// Get the name the Prev now points to
-							//PCWSTR FileNameAfter = (PCWSTR)(TheNextPrevAfter + pFID->FileNameOffset);
-							//ULONG FileNameLengthAfter = *(PULONG)(TheNextPrevAfter + pFID->FileNameLengthOffset);
-							//if (FileNameLengthAfter)
-							//{
-							//UNICODE_STRING FileNameAfterDebug;
-							//RtlInitUnicodeString(&FileNameAfterDebug, FileNameAfter);
-							//LOG("----The name of prev->next before change: %wZ", FileNameAfterDebug);
-							//}
-							//else {
-							//	LOG("----The name of prev->next after change: is not existing");
-							//}
 						}
 					}
-
 					break;
 				}
 
@@ -619,44 +644,26 @@ OnPreDirectoryControl(
 )
 {
 	UNREFERENCED_PARAMETER(FltObjects);
-	LOG("Enter");
-	if (Data->RequestorMode == KernelMode /*|| Data->Iopb->MinorFunction != IRP_MN_QUERY_DIRECTORY*/)
+
+	if (Data->RequestorMode == KernelMode)
 		return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
 	POBJECT_NAME_INFORMATION NameInfo;
 	if (!NT_SUCCESS(IoQueryFileDosDeviceName(FltObjects->FileObject, &NameInfo)))
 		return FLT_PREOP_SUCCESS_NO_CALLBACK;
-
+	
 	// Test if querying the quarantine directory
 	FLT_PREOP_CALLBACK_STATUS Status = FLT_PREOP_SUCCESS_WITH_CALLBACK;
 	UNICODE_STRING DosPath = NameInfo->Name;
-	LOG("Pre Querying/change: '%wZ',  Our quarantine dir: '%wZ'", DosPath, *g_pQuarantineDirPath);
 	if (RtlEqualUnicodeString(&DosPath, g_pQuarantineDirPath, TRUE))
 	{
-
-		//if (Data->Iopb->MinorFunction == IRP_MN_QUERY_DIRECTORY)
-		//{
-			// Found out that this is an IO req on the quarantine folder
-			LOG("IO request on the Quarantine dir: ('%wZ')", DosPath);
-			Data->IoStatus.Status = STATUS_NOT_FOUND;
-			Data->IoStatus.Information = 0;
-			Status = FLT_PREOP_COMPLETE;
-			goto exit;
-		//}
-		//else if (Data->Iopb->MinorFunction  == IRP_MN_NOTIFY_CHANGE_DIRECTORY)
-		//{
-
-		//	goto exit;
-		//}
-		//else if (Data->Iopb->MinorFunction == IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX)
-		//{
-
-		//	goto exit;
-		//}
+		// Found out that this is an IO req on the quarantine folder
+		LOG("Blocking IO request on the our directory: ('%wZ')", DosPath);
+		Data->IoStatus.Status = STATUS_NOT_FOUND;
+		Data->IoStatus.Information = 0;
+		Status = FLT_PREOP_COMPLETE;
 	}
 
-exit:
 	ExFreePool(NameInfo);
-
 	return Status;
 }

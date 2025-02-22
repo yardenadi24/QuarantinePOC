@@ -86,3 +86,9 @@ OnPreDirectoryControl(
 	PCFLT_RELATED_OBJECTS FltObjects,
 	PVOID*
 );
+
+FLT_PREOP_CALLBACK_STATUS OnPreCreateFile(
+	PFLT_CALLBACK_DATA Data,
+	PCFLT_RELATED_OBJECTS FltObjects,
+	PVOID*
+);
