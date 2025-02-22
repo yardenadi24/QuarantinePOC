@@ -1,8 +1,12 @@
 #include "drv.h"
 
 PFLT_FILTER g_pFilter;
+PFLT_PORT g_pServerPort;
+PFLT_PORT g_pClientPort;
 PDRIVER_OBJECT g_pDriverObject;
 PUNICODE_STRING g_pQuarantineDirPath;
+
+
 
 NTSTATUS
 CompleteRequest(
@@ -20,7 +24,9 @@ CompleteRequest(
 
 extern "C"
 NTSTATUS
-DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
+DriverEntry(
+	PDRIVER_OBJECT DriverObject,
+	PUNICODE_STRING RegistryPath)
 {
 	UNREFERENCED_PARAMETER(DriverObject);
 	UNREFERENCED_PARAMETER(RegistryPath);
@@ -41,7 +47,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 		Status = InitMiniFilter(DriverObject, RegistryPath);
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("Failed to init minifilter (0x%u)", Status);
+			LOG("Failed to init minifilter (0x%X)", Status);
 			break;
 		}
 		
@@ -57,7 +63,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 			&DeviceObj);
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("Failed to create device (0x%u)", Status);
+			LOG("Failed to create device (0x%X)", Status);
 			break;
 		}
 
@@ -65,7 +71,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 		Status = IoCreateSymbolicLink(&Symlink, &DeviceName);
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("Failed to symboliclink (0x%u)", Status);
+			LOG("Failed to symboliclink (0x%X)", Status);
 			break;
 		}
 		else {
@@ -81,6 +87,33 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 		}
 
 		RtlInitUnicodeString(g_pQuarantineDirPath, QuarantineDirPath);
+		
+		UNICODE_STRING PortName = RTL_CONSTANT_STRING(L"\\BackupPort");
+		OBJECT_ATTRIBUTES PortNameObjectAttr;
+		PSECURITY_DESCRIPTOR Sd;
+		Status = FltBuildDefaultSecurityDescriptor(&Sd, FLT_PORT_ALL_ACCESS);
+		if (!NT_SUCCESS(Status)) {
+			LOG("Fail creating SD for port");
+			break;
+		}
+
+		InitializeObjectAttributes(&PortNameObjectAttr, &PortName, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, Sd);
+		// Create the communication port
+		Status = FltCreateCommunicationPort(
+			g_pFilter,
+			&g_pServerPort,
+			&PortNameObjectAttr,
+			NULL,
+			ConnectNotifyCallback,
+			DisconnectNotifyCallback,
+			MessageNotifyCallback,
+			1 // Max connections
+		);
+
+		if (!NT_SUCCESS(Status)) {
+			LOG("Fail creating minifilter port");
+			break;
+		}
 
 		// Start filtering
 		Status = FltStartFiltering(g_pFilter);
@@ -91,14 +124,14 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 		}
 
 
-
-
 	} while (false);
 
 	if (!NT_SUCCESS(Status))
 	{
-		LOG("Error in DriverEntry: 0x%u", Status);
+		LOG("Error in DriverEntry: 0x%X", Status);
 
+		if (g_pServerPort)
+			FltCloseCommunicationPort(g_pServerPort);
 		if (g_pFilter)
 			FltUnregisterFilter(g_pFilter);
 		if (SymlinkCreated)
@@ -117,6 +150,368 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 	g_pDriverObject = DriverObject;
 
 	LOG("DriverEntry success");
+
+	return Status;
+}
+
+VOID
+DisconnectNotifyCallback(
+	PVOID ConnectionCookie
+)
+{
+	UNREFERENCED_PARAMETER(ConnectionCookie);
+	LOG("Enter");
+
+	FltCloseClientPort(g_pFilter, &g_pClientPort);
+	g_pClientPort = NULL;
+}
+
+NTSTATUS
+ConnectNotifyCallback(
+	PFLT_PORT ClientPort,
+	PVOID ServerPortCookie,
+	PVOID ConnectionContext,
+	ULONG SizeOfContext,
+	PVOID* ConnectionPortCookie
+)
+{
+	UNREFERENCED_PARAMETER(ClientPort);
+	UNREFERENCED_PARAMETER(ServerPortCookie);
+	UNREFERENCED_PARAMETER(ConnectionContext);
+	UNREFERENCED_PARAMETER(SizeOfContext);
+	UNREFERENCED_PARAMETER(ConnectionPortCookie);
+	g_pClientPort = ClientPort;
+	LOG("Enter");
+	return NTSTATUS();
+}
+
+NTSTATUS
+MessageNotifyCallback(
+	PVOID PortCookie,
+	PVOID InputBuffer,
+	ULONG InputBufferSize,
+	PVOID OutputBuffer,
+	ULONG OutputBufferSize,
+	PULONG ReturnOutputLength
+)
+{
+	UNREFERENCED_PARAMETER(PortCookie);
+	UNREFERENCED_PARAMETER(InputBuffer);
+	UNREFERENCED_PARAMETER(InputBufferSize);
+	UNREFERENCED_PARAMETER(OutputBuffer);
+	UNREFERENCED_PARAMETER(OutputBufferSize);
+	UNREFERENCED_PARAMETER(ReturnOutputLength);
+	LOG("Enter");
+
+	// Validate input buffer
+	if (InputBuffer == NULL || InputBufferSize < sizeof(COMMAND_MESSAGE))
+	{
+		LOG("Input buffer is invalid (p: 0x%p, size: 0x%X)", InputBuffer, InputBufferSize);
+		return STATUS_INVALID_PARAMETER;
+	}
+
+	PCOMMAND_MESSAGE Cmd = (PCOMMAND_MESSAGE)InputBuffer;
+	NTSTATUS Status = STATUS_SUCCESS;
+
+	*ReturnOutputLength = 0;
+
+	switch (Cmd->Command)
+	{
+	case CMD_QUARANTINE:
+	{
+		// Essential kernel space prefix.
+		WCHAR NtPrefix[] = L"\\??\\";
+
+		// Construct the source path
+		WCHAR SourcePath[MAX_PATH];
+		RtlZeroMemory(SourcePath, sizeof(SourcePath));
+		RtlCopyMemory(SourcePath, NtPrefix, wcslen(NtPrefix) * sizeof(WCHAR));
+		RtlCopyMemory(SourcePath + wcslen(NtPrefix), Cmd->FilePath, wcslen(Cmd->FilePath)*sizeof(WCHAR));
+		
+		// Extract file name
+		PWCHAR Filename = wcsrchr(SourcePath, L'\\');
+		if (Filename == NULL)
+		{
+			LOG("File name cant be found in the file path: (%wZ)", SourcePath);
+			return STATUS_INVALID_PARAMETER;
+		}
+		// Skip last backslash
+		Filename ++; 
+		
+		// Construct the destination path
+		WCHAR DestPath[MAX_PATH];
+		RtlZeroMemory(DestPath, sizeof(DestPath));
+		RtlCopyMemory(DestPath, NtPrefix, wcslen(NtPrefix) * sizeof(WCHAR));
+		RtlCopyMemory(DestPath + wcslen(NtPrefix), QuarantineDirPath, wcslen(QuarantineDirPath) * sizeof(WCHAR));
+		wcscat(DestPath, L"\\");
+		wcscat(DestPath, Filename);
+
+		// Open the source file
+		HANDLE hFile;
+		OBJECT_ATTRIBUTES SourceObjAttr;
+		IO_STATUS_BLOCK IoStatus;
+		UNICODE_STRING UniSourcePath;
+		RtlInitUnicodeString(&UniSourcePath, SourcePath);
+		InitializeObjectAttributes(&SourceObjAttr, &UniSourcePath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+		Status = ZwOpenFile(
+			&hFile,
+			DELETE | SYNCHRONIZE,
+			&SourceObjAttr,
+			&IoStatus,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT);
+		if (!NT_SUCCESS(Status))
+		{
+			LOG("Failed to open the source file to quarantine: (0x%X) path: (%wZ)", Status, UniSourcePath);
+			return Status;;
+		}
+
+		// Prepare FILE_NAME_INFORMATION for moving the file
+		SIZE_T RenameInfoSize = sizeof(FILE_RENAME_INFORMATION) + (wcslen(DestPath)*sizeof(WCHAR));
+		PFILE_RENAME_INFORMATION RenameInfo = (PFILE_RENAME_INFORMATION)ExAllocatePool2(POOL_FLAG_PAGED, RenameInfoSize, 'mner');
+		if (RenameInfo == NULL)
+		{
+			ZwClose(hFile);
+			LOG("Failed allocating memory for the FILE_RENAME_INFORMATION (0x%X)", Status);
+			return STATUS_INSUFFICIENT_RESOURCES;
+		}
+
+		RtlZeroMemory(RenameInfo, RenameInfoSize);
+		RenameInfo->ReplaceIfExists = TRUE;
+		RenameInfo->RootDirectory = NULL;
+		RenameInfo->FileNameLength = (ULONG)(wcslen(DestPath) * sizeof(WCHAR));
+		RtlCopyMemory(RenameInfo->FileName, DestPath, RenameInfo->FileNameLength);
+
+		Status = ZwSetInformationFile(
+			hFile,
+			&IoStatus,
+			RenameInfo,
+			(ULONG)RenameInfoSize,
+			FileRenameInformation
+		);
+
+		ExFreePool(RenameInfo);
+		ZwClose(hFile);
+
+		if (!NT_SUCCESS(Status)) {
+			LOG("Failed to move file to quarantine: 0x%X", Status);
+			break;
+		}
+
+		// Create .orig file to store original path
+		WCHAR OrigFilePath[MAX_PATH];
+		RtlZeroMemory(OrigFilePath, MAX_PATH*sizeof(WCHAR));
+		RtlCopyMemory(OrigFilePath, NtPrefix, wcslen(NtPrefix) * sizeof(WCHAR));
+		RtlCopyMemory(OrigFilePath + wcslen(NtPrefix), QuarantineDirPath, wcslen(QuarantineDirPath) * sizeof(WCHAR));
+		wcscat(OrigFilePath, L"\\");
+		wcscat(OrigFilePath, Filename);
+		wcscat(OrigFilePath, L".orig");
+
+		UNICODE_STRING UniOrigPath;
+		OBJECT_ATTRIBUTES OrigObjAttr;
+		RtlInitUnicodeString(&UniOrigPath, OrigFilePath);
+		InitializeObjectAttributes(&OrigObjAttr, &UniOrigPath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+		HANDLE hOrigFile;
+		LARGE_INTEGER OrigFileSize;
+		OrigFileSize.QuadPart = MAX_PATH * sizeof(WCHAR) * 2;
+		Status = ZwCreateFile(
+			&hOrigFile,
+			GENERIC_WRITE | FILE_WRITE_DATA | SYNCHRONIZE,
+			&OrigObjAttr,
+			&IoStatus,
+			&OrigFileSize,
+			FILE_ATTRIBUTE_NORMAL,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			FILE_CREATE,
+			FILE_SYNCHRONOUS_IO_NONALERT,
+			NULL,
+			0);
+
+		if (NT_SUCCESS(Status)) {
+			UNICODE_STRING UniSource;
+			RtlInitUnicodeString(&UniSource, SourcePath);
+			Status = ZwWriteFile(
+				hOrigFile,
+				NULL,
+				NULL,
+				NULL,
+				&IoStatus,
+				UniSource.Buffer,
+				UniSource.Length,
+				NULL,
+				NULL
+			);
+			
+			if (!NT_SUCCESS(Status)) {
+				LOG("Failed to write original path to .orig file: 0x%X", Status);
+			}
+			
+			ZwClose(hOrigFile);
+		
+		}
+		else {
+			LOG("Failed to create .orig file: 0x%X", Status);
+		}
+
+		break;
+	}
+	case CMD_RELEASE:
+	{
+		// Essential kernel space prefix.
+		WCHAR NtPrefix[] = L"\\??\\";
+
+		// Release a file: Move back to original path and delete .orig file
+		WCHAR Filename[MAX_PATH];
+		RtlZeroMemory(Filename, sizeof(Filename));
+		RtlCopyMemory(Filename, Cmd->FilePath, wcslen(Cmd->FilePath) * sizeof(WCHAR));
+
+		// Construct quarantined file path
+		WCHAR QuarPath[MAX_PATH];
+		RtlZeroMemory(QuarPath, sizeof(QuarPath));
+		RtlCopyMemory(QuarPath, NtPrefix, wcslen(NtPrefix) * sizeof(WCHAR));
+		RtlCopyMemory(QuarPath + wcslen(NtPrefix), QuarantineDirPath, wcslen(QuarantineDirPath) * sizeof(WCHAR));
+		wcscat(QuarPath, L"\\");
+		wcscat(QuarPath, Filename);
+
+		// Construct .orig file path
+		WCHAR OrigFilePath[MAX_PATH];
+		RtlZeroMemory(OrigFilePath, sizeof(OrigFilePath));
+		RtlCopyMemory(OrigFilePath, QuarPath, wcslen(QuarPath) * sizeof(WCHAR));
+		wcscat(OrigFilePath, L".orig");
+
+		// Read original path from .orig file
+		HANDLE hOrigFile;
+		OBJECT_ATTRIBUTES ObjAttr;
+		IO_STATUS_BLOCK IoStatus;
+		UNICODE_STRING UniOrigPath;
+		RtlInitUnicodeString(&UniOrigPath, OrigFilePath);
+		InitializeObjectAttributes(&ObjAttr, &UniOrigPath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+		// Open origin file
+		Status = ZwOpenFile(
+			&hOrigFile,
+			DELETE | SYNCHRONIZE,
+			&ObjAttr,
+			&IoStatus,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT);
+		if (!NT_SUCCESS(Status)) {
+			LOG("Failed to open .orig file for reading: 0x%X", Status);
+			break;
+		}
+
+		// Read its content which is the source file path
+		WCHAR OriginalPath[MAX_PATH];
+		Status = ZwReadFile(
+			hOrigFile,
+			NULL,
+			NULL,
+			NULL,
+			&IoStatus,
+			OriginalPath,
+			MAX_PATH*sizeof(WCHAR),
+			NULL,
+			NULL
+		);
+		ZwClose(hOrigFile);
+		if (!NT_SUCCESS(Status)) {
+			LOG("Failed to read original path: 0x%X", Status);
+			break;
+		}
+
+		// Put null terminate
+		OriginalPath[IoStatus.Information / sizeof(WCHAR)] = L'\0';
+
+		// Open the quarantined file for moving
+		HANDLE hFile;
+		UNICODE_STRING UniQuarPath;
+		RtlInitUnicodeString(&UniQuarPath, QuarPath);
+		InitializeObjectAttributes(&ObjAttr, &UniQuarPath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+		Status = ZwOpenFile(
+			&hFile,
+			DELETE | SYNCHRONIZE,
+			&ObjAttr,
+			&IoStatus,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT
+		);
+		if (!NT_SUCCESS(Status)) {
+			LOG("Failed to open quarantined file for release: 0x%X", Status);
+			break;
+		}
+
+		// Prepare FILE_RENAME_INFORMATION
+		size_t RenameInfoSize = sizeof(FILE_RENAME_INFORMATION) + wcslen(OriginalPath) * sizeof(WCHAR);
+		PFILE_RENAME_INFORMATION RenameInfo = (PFILE_RENAME_INFORMATION)ExAllocatePool2(POOL_FLAG_PAGED, RenameInfoSize, 'mner');
+		if (RenameInfo == NULL) {
+			ZwClose(hFile);
+			return STATUS_INSUFFICIENT_RESOURCES;
+		}
+
+		RtlZeroMemory(RenameInfo, RenameInfoSize);
+		RenameInfo->ReplaceIfExists = TRUE;
+		RenameInfo->RootDirectory = NULL;
+		RenameInfo->FileNameLength = (ULONG)wcslen(OriginalPath) * sizeof(WCHAR);
+		RtlCopyMemory(RenameInfo->FileName, OriginalPath, RenameInfo->FileNameLength);
+
+		// Set file information
+		Status = ZwSetInformationFile(
+			hFile,
+			&IoStatus,
+			RenameInfo,
+			(ULONG)RenameInfoSize,
+			FileRenameInformation
+		);
+
+		ExFreePool(RenameInfo);
+		ZwClose(hFile);
+
+		if (!NT_SUCCESS(Status)) {
+			LOG("Failed to move file back to original path: 0x%X", Status);
+			break;
+		}
+
+		InitializeObjectAttributes(&ObjAttr, &UniOrigPath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+		// Delete the .orig file
+		HANDLE hOrigToDelete;
+		Status = ZwOpenFile(
+			&hOrigToDelete,
+			DELETE | SYNCHRONIZE,
+			&ObjAttr,
+			&IoStatus,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT
+		);
+
+		if (NT_SUCCESS(Status)) {
+			FILE_DISPOSITION_INFORMATION DispInfo;
+			DispInfo.DeleteFile = TRUE;
+			Status = ZwSetInformationFile(
+				hOrigToDelete,
+				&IoStatus,
+				&DispInfo,
+				sizeof(DispInfo),
+				FileDispositionInformation
+			);
+			ZwClose(hOrigToDelete);
+			if (!NT_SUCCESS(Status)) {
+				LOG("Failed to delete .orig file: 0x%X", Status);
+			}
+		}
+		break;
+	}
+	case CMD_LIST:
+	{
+		break;
+	}
+	default:
+		LOG("Invalid command: (0x%X)", Cmd->Command);
+		return STATUS_INVALID_PARAMETER;
+	}
+
 
 	return Status;
 }
@@ -166,7 +561,7 @@ InitMiniFilter(
 			&KeyAttr);
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("ZwOpenKey::Failed open key (0x%u)", Status);
+			LOG("ZwOpenKey::Failed open key (0x%X)", Status);
 			break;
 		}
 
@@ -189,7 +584,7 @@ InitMiniFilter(
 			NULL);
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("ZwCreateKey::Failed open subkey (0x%u)", Status);
+			LOG("ZwCreateKey::Failed open subkey (0x%X)", Status);
 			break;
 		}
 
@@ -205,7 +600,7 @@ InitMiniFilter(
 			sizeof(Name));
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("ZwSetValueKey::Failed setting default instance name (0x%u)", Status);
+			LOG("ZwSetValueKey::Failed setting default instance name (0x%X)", Status);
 			break;
 		}
 
@@ -230,7 +625,7 @@ InitMiniFilter(
 		);
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("ZwCreateKey::Failed creating instance key (0x%u)", Status);
+			LOG("ZwCreateKey::Failed creating instance key (0x%X)", Status);
 			break;
 		}
 
@@ -246,7 +641,7 @@ InitMiniFilter(
 			sizeof(Altitude));
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("ZwSetValueKey::Failed writing altitude (0x%u)", Status);
+			LOG("ZwSetValueKey::Failed writing altitude (0x%X)", Status);
 			break;
 		}
 
@@ -262,7 +657,7 @@ InitMiniFilter(
 			sizeof(Flags));
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("ZwSetValueKey::Failed writing flags (0x%u)", Status);
+			LOG("ZwSetValueKey::Failed writing flags (0x%X)", Status);
 			break;
 		}
 
@@ -294,7 +689,7 @@ InitMiniFilter(
 		Status = FltRegisterFilter(pDriverObject, &Reg, &g_pFilter);
 		if (!NT_SUCCESS(Status))
 		{
-			LOG("FltRegisterFilter::Failed FltRegisterFilter (0x%u)", Status);
+			LOG("FltRegisterFilter::Failed FltRegisterFilter (0x%X)", Status);
 			break;
 		}
 
@@ -326,6 +721,8 @@ QuarantineUnload(
 {
 	UNREFERENCED_PARAMETER(Flags);
 	LOG("Unloading quarantine filter");
+	if (g_pServerPort)
+		FltCloseCommunicationPort(g_pServerPort);
 	FltUnregisterFilter(g_pFilter);
 	UNICODE_STRING Symlink = RTL_CONSTANT_STRING(L"\\??\\Quarantine");
 	IoDeleteSymbolicLink(&Symlink);

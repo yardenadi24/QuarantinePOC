@@ -8,11 +8,30 @@
 
 #define DRIVER_TAG 'tnrQ'
 #define DRIVER_PREFIX "QuarantineDrv: "
+#define PORT_NAME L"\\QuarantineDrv"
 
 #define LOG(s, ...) DbgPrint(DRIVER_PREFIX "%s::" s "\n",__FUNCTION__,__VA_ARGS__)
 
-#define MAX_PATH 256
 #define QuarantineDirPath L"C:\\EdrPOC\\Quarantine"
+#define MAX_PATH 256
+
+
+// Command codes
+#define CMD_QUARANTINE 0x1
+#define CMD_RELEASE    0x2
+#define CMD_LIST       0x3
+
+// Input message structure from user-mode
+typedef struct _COMMAND_MESSAGE {
+	ULONG Command;       // Command type (CMD_QUARANTINE, CMD_RELEASE, CMD_LIST)
+	WCHAR FilePath[MAX_PATH]; // File path for quarantine/release (MAX_PATH)
+} COMMAND_MESSAGE, * PCOMMAND_MESSAGE;
+
+// Output structure for CMD_LIST response
+typedef struct _LIST_RESPONSE {
+	ULONG FileCount;     // Number of files in the response
+	WCHAR FileNames[1][MAX_PATH]; // Array of file names (dynamically sized)
+} LIST_RESPONSE, * PLIST_RESPONSE;
 
 // Declarations
 
@@ -91,4 +110,28 @@ FLT_PREOP_CALLBACK_STATUS OnPreCreateFile(
 	PFLT_CALLBACK_DATA Data,
 	PCFLT_RELATED_OBJECTS FltObjects,
 	PVOID*
+);
+
+VOID
+DisconnectNotifyCallback(
+	PVOID ConnectionCookie
+);
+
+NTSTATUS
+ConnectNotifyCallback(
+	PFLT_PORT ClientPort,
+	PVOID ServerPortCookie,
+	PVOID ConnectionContext,
+	ULONG SizeOfContext,
+	PVOID* ConnectionPortCookie
+);
+
+NTSTATUS
+MessageNotifyCallback(
+	PVOID PortCookie,
+	PVOID InputBuffer,
+	ULONG InputBufferSize,
+	PVOID OutputBuffer,
+	ULONG OutputBufferSize,
+	PULONG ReturnOutputLength
 );
