@@ -27,10 +27,13 @@ typedef struct _COMMAND_MESSAGE {
 	WCHAR FilePath[MAX_PATH]; // File path for quarantine/release (MAX_PATH)
 } COMMAND_MESSAGE, * PCOMMAND_MESSAGE;
 
-// Output structure for CMD_LIST response
-typedef struct _LIST_RESPONSE {
-	ULONG FileCount;     // Number of files in the response
-	WCHAR FileNames[1][MAX_PATH]; // Array of file names (dynamically sized)
+#define MAX_FILES 100
+#define MAX_FILENAME_LENGTH 256
+
+typedef struct _LIST_RESPONSE
+{
+	ULONG FileCount;
+	WCHAR Files[MAX_FILES][MAX_FILENAME_LENGTH];
 } LIST_RESPONSE, * PLIST_RESPONSE;
 
 // Declarations

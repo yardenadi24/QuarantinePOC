@@ -233,8 +233,10 @@ MessageNotifyCallback(
 		if (Filename == NULL)
 		{
 			LOG("File name cant be found in the file path: (%wZ)", SourcePath);
-			return STATUS_INVALID_PARAMETER;
+			Status =  STATUS_INVALID_PARAMETER;
+			break;
 		}
+
 		// Skip last backslash
 		Filename ++; 
 		
@@ -263,7 +265,7 @@ MessageNotifyCallback(
 		if (!NT_SUCCESS(Status))
 		{
 			LOG("Failed to open the source file to quarantine: (0x%X) path: (%wZ)", Status, UniSourcePath);
-			return Status;;
+			break;
 		}
 
 		// Prepare FILE_NAME_INFORMATION for moving the file
@@ -273,7 +275,8 @@ MessageNotifyCallback(
 		{
 			ZwClose(hFile);
 			LOG("Failed allocating memory for the FILE_RENAME_INFORMATION (0x%X)", Status);
-			return STATUS_INSUFFICIENT_RESOURCES;
+			Status = STATUS_INSUFFICIENT_RESOURCES;
+			break;
 		}
 
 		RtlZeroMemory(RenameInfo, RenameInfoSize);
@@ -447,7 +450,8 @@ MessageNotifyCallback(
 		PFILE_RENAME_INFORMATION RenameInfo = (PFILE_RENAME_INFORMATION)ExAllocatePool2(POOL_FLAG_PAGED, RenameInfoSize, 'mner');
 		if (RenameInfo == NULL) {
 			ZwClose(hFile);
-			return STATUS_INSUFFICIENT_RESOURCES;
+			Status = STATUS_INSUFFICIENT_RESOURCES;
+			break;
 		}
 
 		RtlZeroMemory(RenameInfo, RenameInfoSize);
@@ -505,11 +509,110 @@ MessageNotifyCallback(
 	}
 	case CMD_LIST:
 	{
+		// Listing all quarantined files
+		LOG("Listing quarantine directory");
+
+		// Validate output buffer
+		if (OutputBuffer == NULL || OutputBufferSize < sizeof(LIST_RESPONSE))
+		{
+			LOG("Invalid output buffer for CMD_LIST");
+			return STATUS_BUFFER_TOO_SMALL;
+		}
+
+		WCHAR NtPrefix[] = L"\\??\\";
+
+		// Construct Quarantine Directory Path
+		WCHAR QuarDir[MAX_PATH];
+		RtlZeroMemory(QuarDir, sizeof(QuarDir));
+		RtlCopyMemory(QuarDir, NtPrefix, wcslen(NtPrefix) * sizeof(WCHAR));
+		RtlCopyMemory(QuarDir + wcslen(NtPrefix), QuarantineDirPath, wcslen(QuarantineDirPath) * sizeof(WCHAR));
+
+		UNICODE_STRING UniQuarPath;
+		OBJECT_ATTRIBUTES ObjAttr;
+		IO_STATUS_BLOCK IoStatus;
+
+		RtlInitUnicodeString(&UniQuarPath, QuarDir);
+		InitializeObjectAttributes(&ObjAttr, &UniQuarPath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+		HANDLE hDir;
+		Status = ZwOpenFile(
+			&hDir,
+			FILE_LIST_DIRECTORY | SYNCHRONIZE,
+			&ObjAttr,
+			&IoStatus,
+			FILE_SHARE_READ | FILE_SHARE_WRITE,
+			FILE_OPEN | FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+		if (!NT_SUCCESS(Status))
+		{
+			LOG("Failed to open quarantine directory: 0x%X", Status);
+			break;
+		}
+		
+		// Buffer for storing directory entries
+		UCHAR Buffer[4096];
+		PFILE_DIRECTORY_INFORMATION FileInfo = (PFILE_DIRECTORY_INFORMATION)Buffer;
+
+		LIST_RESPONSE* ListResponse = (LIST_RESPONSE*)OutputBuffer;
+		ListResponse->FileCount = 0;
+
+		while (TRUE)
+		{
+
+			Status = ZwQueryDirectoryFile(
+				hDir,
+				NULL,
+				NULL,
+				NULL,
+				&IoStatus,
+				Buffer,
+				sizeof(Buffer),
+				FileDirectoryInformation,
+				FALSE,
+				NULL,
+				FALSE
+			);
+
+			if (!NT_SUCCESS(Status))
+			{
+				if (Status == STATUS_NO_MORE_FILES)
+					Status = STATUS_SUCCESS;
+				else
+					LOG("ZwQueryDirectoryFile failed: 0x%X", Status);
+
+				break;
+			}
+
+			// Iterate through all entries in the buffer
+			while (TRUE)
+			{
+				if (ListResponse->FileCount >= MAX_FILES)
+					break;
+
+				UNICODE_STRING FileName;
+				FileName.Buffer = FileInfo->FileName;
+				FileName.Length = (USHORT)FileInfo->FileNameLength;
+				FileName.MaximumLength = (USHORT)FileInfo->FileNameLength;
+				
+				// Copy filename to response
+				RtlCopyMemory(ListResponse->Files[ListResponse->FileCount], FileName.Buffer, FileName.Length);
+				ListResponse->Files[ListResponse->FileCount][FileName.Length / sizeof(WCHAR)] = L'\0';
+				ListResponse->FileCount++;
+
+				if (FileInfo->NextEntryOffset == 0)
+					break;
+
+				FileInfo = (PFILE_DIRECTORY_INFORMATION)((PUCHAR)FileInfo + FileInfo->NextEntryOffset);
+			}
+		}
+
+		ZwClose(hDir);
+		*ReturnOutputLength = sizeof(LIST_RESPONSE);
+		LOG("Successfully listed %d quarantine files", ListResponse->FileCount);
 		break;
 	}
 	default:
 		LOG("Invalid command: (0x%X)", Cmd->Command);
-		return STATUS_INVALID_PARAMETER;
+		Status =  STATUS_INVALID_PARAMETER;
 	}
 
 
